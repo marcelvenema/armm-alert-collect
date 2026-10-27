@@ -298,18 +298,20 @@ The current state of every EPAR document: one row per record in EMA's documents 
 marked **tracked** are recorded in [`ema_changes`](#43-ema_changes), for the monitored types only (see
 `type`). Not customer data and not personal data.
 
-As in `ema_products`, columns have the same names as the fields in EMA's file, empty strings become `null` and
+As in `ema_products`, columns have the same names as the fields in EMA's file (except EMA's `id`, stored as
+`ema_document_id` because `id` is our uuid), empty strings become `null` and
 leading and trailing spaces are trimmed (307 values have them, 46 of them in `ema_product_number`).
 
 Figures are from the file of 26-10-2026 (`meta.timestamp` 2026-10-26T05:50:10Z, 20,317 records).
 
-**EMA overwrites the file.** A new version of a document keeps its `id` and its `document_url`; only
+**EMA overwrites the file.** A new version of a document keeps its EMA id (`ema_document_id`) and its `document_url`; only
 `last_updated_date` changes, and the old file is gone. So this table only ever holds the latest version, and a
 change of `last_updated_date` is how a new version is detected.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `id` | text PK | EMA's document id, e.g. `2410`. Unique and stable. Numeric, but stored as text because it's EMA's key, not a number we calculate with. An exception to the UUID rule (§1), like `ema_product_number`. |
+| `id` | uuid PK | Our own id, generated when the document is first imported (§1). Every document has a unique uuid; other tables refer to the document by it. |
+| `ema_document_id` | text, not null, unique | EMA's document id (`id` in EMA's file), e.g. `2410`. Unique and stable; the import matches records on it. Numeric, but stored as text because it's EMA's key, not a number we calculate with. |
 | `ema_product_number` | text, null | The product the document belongs to; joins on [`ema_products`](#41-ema_products). **No foreign key**: after trimming, 7 documents have no matching product (6 for `EMEA/H/C/005152`, 1 without a number), and EMA's two files aren't published at exactly the same moment. Null for that one document. Indexed. |
 | `medicine_name` | text, null | Product name as given in the documents file; up to 125 characters. |
 | `name` | text, not null | Document title, e.g. `Padcev : EPAR - Product information`. Up to 243 characters. Not unique. |
@@ -350,39 +352,13 @@ are alerted about:
 | `orphan-maintenance-report-post` | 60 | no | |
 
 A product usually has one document per monitored type, but not always: some have two `product-information`
-or up to three `rmp-summary` documents. So the key is always the document `id`, never
-`(ema_product_number, type)`.
+or up to three `rmp-summary` documents. So a document is always identified by its `id` (or EMA's
+`ema_document_id`), never by `(ema_product_number, type)`.
 
 Indexes: `(ema_product_number, type)`, `last_updated_date`.
 
-### 4.3 `ema_changes`
-One changed record in the ema_products database. Kept for **7 years** (§9). 
 
-| Column | Type | Notes |
-| --- | --- | --- |
-| `id` | uuid PK | Also the RSS `<guid>`. |
-| `update_run_id` | uuid FK → armm_update_runs, not null | |
-| `change_type` | enum `created` \| `updated` \| `deleted`, not null | |
-| `entity_type` | enum `ema_product` \| `ema_document`, not null | Which table the changed record is in: [`ema_products`](#41-ema_products) or [`ema_documents`](#42-ema_documents). A new source adds its own values. |
-| `entity_ref` | text, not null | The key of that record: `ema_product_number` (e.g. `EMEA/H/C/005392`) for `ema_product`, the EMA document `id` (e.g. `2410`) for `ema_document`. |
-| `title` | text, not null | Short description, used in the app, digests and feeds. |
-| `summary` | text, null | One or two sentences; shown in digests and RSS. |
-| `details` | jsonb, null | `{ "fields": [{ "field", "from", "to" }] }`; shown only in the app. For `ema_document` also `product_number`, `product_name`, `type`, `document_version_id`, `last_updated_date` and `document_url`. |
-| `changed_at` | timestamptz, not null | When it happened (the run's `run_finished_at`). |
-| `created_at` | timestamptz, not null | When it was recorded; digest periods use this. |
-
-Which events become a change, per `entity_type`:
-
-| `entity_type` | `change_type` | When |
-| --- | --- | --- |
-| `ema_product` | `created` | A new product in EMA's medicines file (not on the first import). |
-| `ema_product` | `updated` | One or more **tracked** fields changed (§4.1); one row per product per run, all fields in `details.fields`. |
-| `ema_product` | `deleted` | The product is no longer in EMA's file. |
-| `ema_document` | `created` | A new document of a monitored type (§4.2) (not on the first import). |
-| `ema_document` | `updated` | A **tracked** field of a monitored document changed (§4.2): a new version (`last_updated_date` or `document_url`, §4.4), or its `status` or `type`. |
-| `ema_document` | `deleted` | A monitored document is no longer in EMA's file. |
-
-### 4.4 `ema_document_versions`
+### 4.3 `ema_document_versions`
 
 The version history of each document: one row per version of an [`ema_documents`](#42-ema_documents) row
 that the import has seen. EMA keeps no history and overwrites the file at the same URL (§4.2), so this table
@@ -392,10 +368,10 @@ the archive fills in `file_sha256` / `file_error` afterwards.
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | uuid PK | |
-| `document_id` | text FK → ema_documents, not null | |
+| `document_id` | uuid FK → ema_documents, not null | The document's uuid `id`. |
 | `ema_product_number` | text, null | Copied from the document at detection, so the history of a product stays complete if a document is later moved to another product. |
 | `type` | text, not null | Copied from the document at detection. |
-| `version_kind` | enum `baseline` \| `new` \| `updated` \| `removed`, not null | `baseline`: present at the very first import, so it's unknown when it appeared. `new`: a document id seen for the first time after that. `updated`: a different `last_updated_date` (or `document_url`). `removed`: gone from EMA's file. |
+| `version_kind` | enum `baseline` \| `new` \| `updated` \| `removed`, not null | `baseline`: present at the very first import, so it's unknown when it appeared. `new`: an `ema_document_id` seen for the first time after that. `updated`: a different `last_updated_date` (or `document_url`). `removed`: gone from EMA's file. |
 | `last_updated_date` | timestamptz, null | EMA's `last_updated_date` of this version: when EMA published it. Null for the few documents without one (§4.2). |
 | `document_url` | text, not null | The URL at the time. |
 | `detected_run_id` | uuid FK → armm_update_runs, not null | The run that found this version. |
@@ -414,7 +390,7 @@ the archive fills in `file_sha256` / `file_error` afterwards.
 - Indexes: `(document_id, last_updated_date desc)` for a document's history; `(ema_product_number,
   last_updated_date desc)` for a product's history; `file_sha256` where it's null, for the archive's to-do list.
 
-### 4.5 `ema_document_files`
+### 4.4 `ema_document_files`
 
 The archived files, stored in PostgreSQL. A file is stored once per content: the key is the SHA-256 of its
 bytes, so if EMA republishes an identical file, the new version points to the existing row.
@@ -427,6 +403,35 @@ bytes, so if EMA republishes an identical file, the new version points to the ex
 | `size_bytes` | integer, not null | 1–3 MB is typical for a PI or RMP. |
 | `source_url` | text, not null | Where it was first downloaded. |
 | `downloaded_at` | timestamptz, not null | |
+
+
+### 4.5 `ema_changes`
+One changed record in the ema_products database. Kept for **7 years** (§9). 
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | uuid PK | Also the RSS `<guid>`. |
+| `update_run_id` | uuid FK → armm_update_runs, not null | |
+| `change_type` | enum `created` \| `updated` \| `deleted`, not null | |
+| `entity_type` | enum `ema_product` \| `ema_document`, not null | Which table the changed record is in: [`ema_products`](#41-ema_products) or [`ema_documents`](#42-ema_documents). A new source adds its own values. |
+| `entity_ref` | text, not null | The key of that record: `ema_product_number` (e.g. `EMEA/H/C/005392`) for `ema_product`, the document's uuid `id` for `ema_document`. |
+| `title` | text, not null | Short description, used in the app, digests and feeds. |
+| `summary` | text, null | One or two sentences; shown in digests and RSS. |
+| `details` | jsonb, null | `{ "fields": [{ "field", "from", "to" }] }`; shown only in the app. For `ema_document` also `ema_document_id`, `product_number`, `product_name`, `type`, `document_version_id`, `last_updated_date` and `document_url`. |
+| `changed_at` | timestamptz, not null | When it happened (the run's `run_finished_at`). |
+| `created_at` | timestamptz, not null | When it was recorded; digest periods use this. |
+
+Which events become a change, per `entity_type`:
+
+| `entity_type` | `change_type` | When |
+| --- | --- | --- |
+| `ema_product` | `created` | A new product in EMA's medicines file (not on the first import). |
+| `ema_product` | `updated` | One or more **tracked** fields changed (§4.1); one row per product per run, all fields in `details.fields`. |
+| `ema_product` | `deleted` | The product is no longer in EMA's file. |
+| `ema_document` | `created` | A new document of a monitored type (§4.2) (not on the first import). |
+| `ema_document` | `updated` | A **tracked** field of a monitored document changed (§4.2): a new version (`last_updated_date` or `document_url`, §4.4), or its `status` or `type`. |
+| `ema_document` | `deleted` | A monitored document is no longer in EMA's file. |
+
 
 **Which files are archived**: every version of the monitored types (`product-information`, `rmp`,
 `rmp-summary`) and of `product-information-tracked-changes`, which is needed to show what changed in a PI.
@@ -552,7 +557,7 @@ have no gaps.
 | `users_authentication_codes` | one unconsumed code per `(email, purpose)` for sign-in and sign-up, and per `(user_id, purpose)` for actions |
 | `armm_update_runs` | `source_run_id` |
 | `ema_products` | `ema_product_number`; `medicine_url` |
-| `ema_documents` | `id`; `document_url` |
+| `ema_documents` | `id`; `ema_document_id`; `document_url` |
 | `ema_document_versions` | `(document_id, last_updated_date, document_url)`, nulls not distinct |
 | `ema_document_files` | `sha256` |
 | `ema_changes` | `(update_run_id, entity_type, entity_ref, change_type)` |
