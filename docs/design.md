@@ -115,7 +115,7 @@ A run where EMA had nothing new (same version stamp) writes **no** row: it's log
 therefore appears every time EMA publishes, normally twice a day, so the web app's "no run for 14 hours" alarm
 (armm-database.md §4) fires both when the collector is broken and when EMA stops publishing.
 
-**`ema_changes`** (data-model.md §4.3): one row per change that customers can see.
+**`ema_changes`** (data-model.md §4.6): one row per change that customers can see.
 
 - Written in the **same transaction** as the source's data and as the run's `done` status. A change is never
   visible without its run, and a run is never `done` without all its changes.
@@ -150,6 +150,7 @@ tables.
 | --- | --- | --- |
 | `ema_products` | Current state of each medicine. | §4.1 |
 | `ema_documents` | Current state of each document. | §4.2 |
+| `ema_document_translations` | The stored translations of each document (now only `nl`), one row per language. | §4.3 |
 | `ema_document_versions` | One row per detected version of a document, kept forever. | §4.4 |
 | `ema_document_files` | The archived files (PDF, sometimes Word or Excel), kept forever. | §4.5 |
 

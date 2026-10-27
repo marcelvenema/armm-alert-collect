@@ -44,6 +44,7 @@ erDiagram
     invoice_invoices ||--o{ invoice_payments : "is paid by"
     invoice_invoices ||--o| invoice_invoices : "is credited by"
     ema_products |o..o{ ema_documents : "joins on ema_product_number"
+    ema_documents ||--o{ ema_document_translations : "is translated in"
     ema_documents ||--o{ ema_document_versions : "has"
     ema_document_files |o--o{ ema_document_versions : "is the file of"
     ema_document_versions |o..o| ema_changes : "is reported as"
@@ -51,6 +52,7 @@ erDiagram
     armm_update_runs ||--o{ ema_document_versions : detects
     armm_update_runs ||--o{ ema_products : "first / last seen in"
     armm_update_runs ||--o{ ema_documents : "first / last seen in"
+    armm_update_runs ||--o{ ema_document_translations : "first / last seen in"
 ```
 
 Solid lines are foreign keys; dotted lines are joins without one (`ema_documents.ema_product_number`, and a
@@ -67,7 +69,8 @@ change's `entity_ref`).
 | [`users_digest_deliveries`](#37-users_digest_deliveries) | Sent digest emails | `id` | — | Designed |
 | [`ema_products`](#41-ema_products) | EMA medicines, current state | `ema_product_number` | — | Designed |
 | [`ema_documents`](#42-ema_documents) | EPAR documents, current state | `id` | — | Designed |
-| [`ema_changes`](#43-ema_changes) | Changes customers are alerted about | `id` | — | Designed |
+| [`ema_document_translations`](#43-ema_document_translations) | Translations of the documents, one row per language | `id` | — | Designed |
+| [`ema_changes`](#46-ema_changes) | Changes customers are alerted about | `id` | — | Designed |
 | [`ema_document_versions`](#44-ema_document_versions) | Version history of the documents, kept forever | `id` | — | Designed |
 | [`ema_document_files`](#45-ema_document_files) | Archived document files (PDF etc.), kept forever | `sha256` | — | Designed |
 | [`armm_update_runs`](#51-armm_update_runs) | Runs of the aRMM update process | `id` | `UpdateRun` (store.ts) | Built |
@@ -206,7 +209,7 @@ The secret URL of a customer's RSS feed. At most one is active per user.
 ### 4.1 `ema_products`
 The current state of every EMA medicine: one row per record in EMA's medicines file
 (`medicines-output-medicines_json-report_en.json`), human and veterinary, whatever its status. Upserted on
-every run; changes to the fields marked **tracked** are recorded in [`ema_changes`](#43-ema_changes). Not
+every run; changes to the fields marked **tracked** are recorded in [`ema_changes`](#46-ema_changes). Not
 customer data and not personal data.
 
 Columns have the same names as the fields in EMA's file, so the mapping is one to one. EMA's values are all
@@ -295,7 +298,7 @@ Indexes: `name_of_medicine`, `marketing_authorisation_developer_applicant_holder
 
 The current state of every EPAR document: one row per record in EMA's documents file
 (`documents-output-epar_documents_json-report_en.json`). Upserted on every run; changes to the fields
-marked **tracked** are recorded in [`ema_changes`](#43-ema_changes), for the monitored types only (see
+marked **tracked** are recorded in [`ema_changes`](#46-ema_changes), for the monitored types only (see
 `type`). Not customer data and not personal data.
 
 As in `ema_products`, columns have the same names as the fields in EMA's file (except EMA's `id`, stored as
@@ -322,10 +325,13 @@ change of `last_updated_date` is how a new version is detected.
 | `last_updated_date` | timestamptz, null | ISO 8601 UTC. **Tracked**: a different value means EMA published a new version. Null for 23 documents (overviews and presentation lists), which can then only change by URL. |
 | `consultation_date` | date, null | Always empty in the current file; kept so the mapping stays complete. |
 | `document_url` | text, not null, unique | English version on `www.ema.europa.eu`. Up to 265 characters. Mostly PDF (19,878); also `.docx`, `.doc`, `.xls`, and URLs ending in `.pdf-0`, so the file type is taken from the response, not the URL. **Tracked.** |
-| `translations` | jsonb, null | `{ "<language>": "<url>" }` for up to 25 languages (`bg` … `sv`, plus `is`, `no`, `ga`); never `en`. Only 7,217 documents have it; EMA leaves the field out for the rest, which becomes `null`. Not tracked. |
 
 **Bookkeeping**: `raw`, `first_seen_run_id`, `last_seen_run_id`, `removed_at`, `created_at` / `updated_at`, as in
 `ema_products`.
+
+EMA's `translations` field isn't a column: each translation is a row of its own in
+[`ema_document_translations`](#43-ema_document_translations), so its files can be archived like the English
+ones. It stays in `raw`.
 
 **Document types** (`type`), with the number of documents. Changes to the monitored types are what customers
 are alerted about:
@@ -358,7 +364,42 @@ or up to three `rmp-summary` documents. So a document is always identified by it
 Indexes: `(ema_product_number, type)`, `last_updated_date`.
 
 
-### 4.3 `ema_document_versions`
+### 4.3 `ema_document_translations`
+
+The translations of each document: one row per **stored language** in a document's `translations` field in
+EMA's file (`{ "<language>": "<url>" }`). Upserted on every run, like [`ema_documents`](#42-ema_documents). Their files
+are archived as versions in [`ema_document_versions`](#44-ema_document_versions) with their `language`, like
+the English document. Not tracked: a translation never produces an [`ema_changes`](#46-ema_changes) row.
+
+**Stored languages**: for now only `nl`. The English version isn't a translation: that's the document itself
+(`document_url`). EMA lists up to 25 other languages (the EU languages plus `is` and `no`, about 168,000
+translations in total); those are ignored, and remain only in the document's `raw`. Adding a language is a
+config change: the next run creates its rows and the archive downloads their files as new.
+
+About 7,200 of the 20,300 documents have an `nl` translation; EMA leaves the field out for the rest.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | uuid PK | Our own id (§1). |
+| `document_id` | uuid FK → ema_documents, not null | The document this is a translation of. |
+| `language` | enum, not null | EMA's language code; one of the stored languages, now only `nl`. |
+| `document_url` | text, not null, unique | The translation on `www.ema.europa.eu`, e.g. `…/nl/documents/…_nl.pdf`. Like the English URL, the file type is taken from the response. |
+| `http_etag` / `http_last_modified` | text, null | From the last download, for a conditional request (`If-None-Match` / `If-Modified-Since`) when checking for a new version, so an unchanged file isn't downloaded again. |
+| `last_checked_at` | timestamptz, null | When the archive last checked the URL for a new version. |
+
+**Bookkeeping**: `first_seen_run_id`, `last_seen_run_id`, `removed_at` (the language is no longer in the
+document's `translations`, or the document is gone), `created_at` / `updated_at`, as in `ema_products`.
+
+- Unique on `(document_id, language)`.
+- **A translation has no date of its own.** EMA's file gives no `last_updated_date` per language, and
+  translations often follow a new English version days or weeks later. So a new version of a translation is
+  detected by its content: the archive downloads the URL (conditionally), and a SHA-256 different from the
+  translation's latest version is a new version (`version_kind = 'updated'`).
+- **When a translation is checked**: when it first appears; on every run for 90 days after its document got a
+  new English version, which is when translations change; and otherwise once a month. Only translations of the
+  archived types are checked (see "Which files are archived").
+
+### 4.4 `ema_document_versions`
 
 The version history of each document: one row per version of an [`ema_documents`](#42-ema_documents) row
 that the import has seen. EMA keeps no history and overwrites the file at the same URL (§4.2), so this table
@@ -371,9 +412,10 @@ the archive fills in `file_sha256` / `file_error` afterwards.
 | `document_id` | uuid FK → ema_documents, not null | The document's uuid `id`. |
 | `ema_product_number` | text, null | Copied from the document at detection, so the history of a product stays complete if a document is later moved to another product. |
 | `type` | text, not null | Copied from the document at detection. |
+| `language` | text, not null | `en` for the document itself; otherwise the language of a translation (§4.3). |
 | `version_kind` | enum `baseline` \| `new` \| `updated` \| `removed`, not null | `baseline`: present at the very first import, so it's unknown when it appeared. `new`: an `ema_document_id` seen for the first time after that. `updated`: a different `last_updated_date` (or `document_url`). `removed`: gone from EMA's file. |
-| `last_updated_date` | timestamptz, null | EMA's `last_updated_date` of this version: when EMA published it. Null for the few documents without one (§4.2). |
-| `document_url` | text, not null | The URL at the time. |
+| `last_updated_date` | timestamptz, null | EMA's `last_updated_date` of this version: when EMA published it. Null for the few documents without one (§4.2). For a translation, the document's value at detection; it says which English version the translation was found next to, not when EMA published the translation. |
+| `document_url` | text, not null | The URL at the time (the translation's URL for a translation). |
 | `detected_run_id` | uuid FK → armm_update_runs, not null | The run that found this version. |
 | `detected_at` | timestamptz, not null | |
 | `latest_procedure` | text, null | `ema_products.latest_procedure_affecting_product_information` at detection, e.g. `VR/0000336191`, so a PI change shows which procedure caused it. |
@@ -381,16 +423,19 @@ the archive fills in `file_sha256` / `file_error` afterwards.
 | `file_sha256` | bytea FK → ema_document_files, null | The archived file of this version (§4.5). Null until downloaded, and for types that aren't archived. |
 | `file_error` | text, null | Why the file couldn't be archived, e.g. `superseded` or `HTTP 404`. |
 
-- Unique on `(document_id, last_updated_date, document_url)` with `nulls not distinct`, so running the import
-  twice never records the same version twice, also for documents without a `last_updated_date`, whose new
-  versions can only be told apart by URL.
-- A version of a monitored type (`version_kind` `new`, `updated` or `removed`) also produces an
-  [`ema_changes`](#43-ema_changes) row in the same transaction. `baseline` versions don't, so customers don't get
+- Unique on `(document_id, last_updated_date, document_url)` with `nulls not distinct`, where `language = 'en'`,
+  so running the import twice never records the same version twice, also for documents without a
+  `last_updated_date`, whose new versions can only be told apart by URL.
+- Translations (`language <> 'en'`) are told apart by content instead (§4.3): unique on
+  `(document_id, language, document_url, file_sha256)` with `nulls not distinct`. A translation version is only
+  inserted once its file has been downloaded (or has failed, with `file_error`).
+- A version of the English document of a monitored type (`version_kind` `new`, `updated` or `removed`) also produces an
+  [`ema_changes`](#46-ema_changes) row in the same transaction. `baseline` versions don't, so customers don't get
   thousands of alerts after the first import.
-- Indexes: `(document_id, last_updated_date desc)` for a document's history; `(ema_product_number,
+- Indexes: `(document_id, language, last_updated_date desc)` for a document's history; `(ema_product_number,
   last_updated_date desc)` for a product's history; `file_sha256` where it's null, for the archive's to-do list.
 
-### 4.4 `ema_document_files`
+### 4.5 `ema_document_files`
 
 The archived files, stored in PostgreSQL. A file is stored once per content: the key is the SHA-256 of its
 bytes, so if EMA republishes an identical file, the new version points to the existing row.
@@ -405,7 +450,7 @@ bytes, so if EMA republishes an identical file, the new version points to the ex
 | `downloaded_at` | timestamptz, not null | |
 
 
-### 4.5 `ema_changes`
+### 4.6 `ema_changes`
 One changed record in the ema_products database. Kept for **7 years** (§9). 
 
 | Column | Type | Notes |
@@ -434,14 +479,17 @@ Which events become a change, per `entity_type`:
 
 
 **Which files are archived**: every version of the monitored types (`product-information`, `rmp`,
-`rmp-summary`) and of `product-information-tracked-changes`, which is needed to show what changed in a PI.
-Other types aren't archived; their versions are recorded in `ema_document_versions` without a file.
+`rmp-summary`) and of `product-information-tracked-changes`, which is needed to show what changed in a PI,
+in English and in the stored translations (§4.3, now only `nl`): about 2,500 of these documents have an `nl`
+translation, so the first archive roughly doubles in size. Other types aren't archived; their versions are recorded in `ema_document_versions`
+without a file.
 
 **When a file can still be archived.** EMA overwrites the file, so a version can only be downloaded while it's
 still the current one: the document's `last_updated_date` must still equal the version's. A version that's been
 overtaken before its file was downloaded gets `file_error = 'superseded'` and is never retried; downloading it
 later would store the next version under the wrong row. A failed download that isn't superseded is retried on
-the next run.
+the next run. This applies to translations too, except that a translation's version is only recorded after the
+download (§4.3), so it can't be superseded.
 
 **Size.** The first import archives the current files of the archived types: about 4,000 files (on 26-10-2026:
 2,221 PI, 797 RMP, 679 RMP summary, 330 tracked changes), 4–8 GB. After that about 50–60 files a week,
@@ -558,7 +606,8 @@ have no gaps.
 | `armm_update_runs` | `source_run_id` |
 | `ema_products` | `ema_product_number`; `medicine_url` |
 | `ema_documents` | `id`; `ema_document_id`; `document_url` |
-| `ema_document_versions` | `(document_id, last_updated_date, document_url)`, nulls not distinct |
+| `ema_document_translations` | `id`; `(document_id, language)`; `document_url` |
+| `ema_document_versions` | `(document_id, last_updated_date, document_url)` for `en`, and `(document_id, language, document_url, file_sha256)` for translations, nulls not distinct |
 | `ema_document_files` | `sha256` |
 | `ema_changes` | `(update_run_id, entity_type, entity_ref, change_type)` |
 | `users_feed_tokens` | `token_hash`; at most one unrevoked token per `user_id` |
@@ -591,7 +640,7 @@ audit events can refer to them, only anonymised.
 | `users_authentication_codes` | 24 hours |  |
 | Revoked or expired `users_sessions` | 30 days |  |
 | Full IP addresses (`users_sessions`, `audit_events`) | 30 days, then truncated to /24 or /48 |  |
-| `armm_update_runs` | **Forever.** `ema_changes`, `ema_document_versions` and the `first_seen_run_id` / `last_seen_run_id` of `ema_products` and `ema_documents` refer to it with foreign keys, so a run can't be deleted while those rows exist. About 1,500 small rows a year. |  |
+| `armm_update_runs` | **Forever.** `ema_changes`, `ema_document_versions` and the `first_seen_run_id` / `last_seen_run_id` of `ema_products`, `ema_documents` and `ema_document_translations` refer to it with foreign keys, so a run can't be deleted while those rows exist. About 1,500 small rows a year. |  |
 | `ema_changes` | **7 years**, counted from `created_at`, then deleted by a scheduled job. |  |
 | `ema_document_versions`, `ema_document_files` | **Forever.** Never deleted: they're the only copy of EMA's history, which EMA itself doesn't keep. | design.md §9 |
 | `users_digest_deliveries` | 12 months |  |
